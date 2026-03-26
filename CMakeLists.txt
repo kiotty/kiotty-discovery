@@ -70,3 +70,5 @@ endif()
 if(KIOTTY_DISCOVERY_BUILD_TESTS)
     add_subdirectory(test)
 endif()
+
+add_subdirectory(app)

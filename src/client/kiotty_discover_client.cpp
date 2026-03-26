@@ -2,6 +2,7 @@
 #include "../protocol/kiotty_discovery_protocol.hpp"
 
 #include <cstring>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Platform-specific socket includes
@@ -12,12 +13,16 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <iphlpapi.h>
 #  pragma comment(lib, "ws2_32.lib")
+#  pragma comment(lib, "iphlpapi.lib")
 #  pragma warning(disable: 4996) // strncpy
    typedef int socklen_t;
 #  define KIOTTY_CLOSE_SOCKET(s) ::closesocket(s)
 #else
 #  include <arpa/inet.h>
+#  include <ifaddrs.h>
+#  include <net/if.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
@@ -26,6 +31,61 @@
 #  define SOCKET_ERROR    (-1)
 #  define KIOTTY_CLOSE_SOCKET(s) ::close(s)
 #endif
+
+// ---------------------------------------------------------------------------
+// Enumerate subnet-directed broadcast addresses for all active interfaces.
+// Falls back to INADDR_BROADCAST if none are found.
+// ---------------------------------------------------------------------------
+static std::vector<uint32_t> get_broadcast_addresses() {
+    std::vector<uint32_t> addrs;
+
+#if defined(_WIN32) || defined(_WIN64)
+    ULONG size = 15000;
+    std::vector<char> buf(size);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+
+    DWORD ret = GetAdaptersAddresses(AF_INET,
+        GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+        nullptr, adapters, &size);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(size);
+        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        ret = GetAdaptersAddresses(AF_INET,
+            GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, adapters, &size);
+    }
+    if (ret == NO_ERROR) {
+        for (auto* a = adapters; a; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp) continue;
+            for (auto* uni = a->FirstUnicastAddress; uni; uni = uni->Next) {
+                auto* sa = reinterpret_cast<sockaddr_in*>(uni->Address.lpSockaddr);
+                if (sa->sin_family != AF_INET) continue;
+                uint32_t ip     = ntohl(sa->sin_addr.s_addr);
+                uint8_t  prefix = static_cast<uint8_t>(uni->OnLinkPrefixLength);
+                uint32_t mask   = prefix ? (~0u << (32u - prefix)) : 0u;
+                uint32_t bcast  = (ip & mask) | (~mask);
+                addrs.push_back(htonl(bcast));
+            }
+        }
+    }
+#else
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) == 0) {
+        for (auto* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            if (!(ifa->ifa_flags & IFF_BROADCAST))                      continue;
+            if (!ifa->ifa_broadaddr)                                     continue;
+            auto* bsa = reinterpret_cast<sockaddr_in*>(ifa->ifa_broadaddr);
+            addrs.push_back(bsa->sin_addr.s_addr);
+        }
+        freeifaddrs(ifap);
+    }
+#endif
+
+    if (addrs.empty())
+        addrs.push_back(INADDR_BROADCAST); // last-resort fallback
+    return addrs;
+}
 
 // ---------------------------------------------------------------------------
 // WinSock reference-counted init (no-op on Linux)
@@ -86,14 +146,20 @@ KiottyDiscoveryResult* KiottyDiscoveryClient_discoverServer(uint16_t discovery_p
     local.sin_port        = 0;
     ::bind(sock, reinterpret_cast<struct sockaddr*>(&local), sizeof(local));
 
-    // Send broadcast discovery request
+    // Send discovery request to every subnet's directed broadcast address.
+    // Using per-interface broadcast (e.g. 192.168.1.255) instead of
+    // INADDR_BROADCAST (255.255.255.255) ensures the packet is reliably
+    // delivered on all LAN segments, regardless of VirtualBox or other
+    // virtual adapters the host may have.
     KiottyDiscoveryRequest request;
     struct sockaddr_in bcast {};
-    bcast.sin_family      = AF_INET;
-    bcast.sin_addr.s_addr = INADDR_BROADCAST;
-    bcast.sin_port        = htons(discovery_port);
-    ::sendto(sock, reinterpret_cast<const char*>(&request), sizeof(request), 0,
-             reinterpret_cast<struct sockaddr*>(&bcast), sizeof(bcast));
+    bcast.sin_family = AF_INET;
+    bcast.sin_port   = htons(discovery_port);
+    for (uint32_t bcast_addr : get_broadcast_addresses()) {
+        bcast.sin_addr.s_addr = bcast_addr;
+        ::sendto(sock, reinterpret_cast<const char*>(&request), sizeof(request), 0,
+                 reinterpret_cast<struct sockaddr*>(&bcast), sizeof(bcast));
+    }
 
     // Wait for the first valid response
     char buf[1024] {};
